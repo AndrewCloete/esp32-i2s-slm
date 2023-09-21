@@ -40,12 +40,90 @@
 
 #include <driver/i2s.h>
 #include "sos-iir-filter.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+const char *ssid = "";
+const char *password = "";
+const char *mqtt_server = "";
+#define MQTT_PORT 1883
+#define MQTT_USER ""
+#define MQTT_PASSWORD ""
+#define MQTT_SERIAL_BOOT_CH "/casa/esp32/noise/boot"
+#define MQTT_SERIAL_PUBLISH_CH "/casa/esp32/noise"
+#define MQTT_SERIAL_RECEIVER_CH "/casa/esp32/noise/receive"
+
+WiFiClient wifiClient;
+
+PubSubClient mqttClient(wifiClient);
+
+void setup_wifi()
+{
+  delay(10);
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+  randomSeed(micros());
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+void(* resetFunc) (void) = 0;
+
+void reconnect()
+{
+  // Loop until we're reconnected
+  while (!mqttClient.connected())
+  {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD))
+    {
+      Serial.println("connected");
+      // Once connected, publish an announcement...
+      mqttClient.publish(MQTT_SERIAL_BOOT_CH, "1");
+      // ... and resubscribe
+      //mqttClient.subscribe(MQTT_SERIAL_RECEIVER_CH);
+    }
+    else
+    {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+      resetFunc(); 
+    }
+  }
+}
+
+void callback(char *topic, byte *payload, unsigned int length)
+{
+  Serial.println("-------new message from broker-----");
+  Serial.print("channel:");
+  Serial.println(topic);
+  Serial.print("data:");
+  Serial.write(payload, length);
+  Serial.println();
+}
+
 
 //
 // Configuration
 //
 
-#define LEQ_PERIOD        2           // second(s)
+#define LEQ_PERIOD        5           // second(s)
 #define WEIGHTING         C_weighting // Also avaliable: 'C_weighting' or 'None' (Z_weighting)
 #define LEQ_UNITS         "LAeq"      // customize based on above weighting used
 #define DB_UNITS          "dBA"       // customize based on above weighting used
@@ -333,6 +411,23 @@ void mic_i2s_reader_task(void* parameter) {
   }
 }
 
+#define MQTT_TASK_PRI   4
+#define MQTT_TASK_STACK 2048
+void mqtt_loop_task(void* parameter) {
+  while (true) {
+    mqttClient.loop();
+  }
+}
+
+void publishSerialData(char *serialData)
+{
+  if (!mqttClient.connected())
+  {
+    reconnect();
+  }
+  mqttClient.publish(MQTT_SERIAL_PUBLISH_CH, serialData);
+}
+
 //
 // Setup and main loop 
 //
@@ -346,7 +441,12 @@ void setup() {
   setCpuFrequencyMhz(80); // It should run as low as 80MHz
   
   Serial.begin(112500);
-  delay(1000); // Safety
+  delay(500); // Safety
+  Serial.setTimeout(500); // Set time out for
+  setup_wifi();
+  mqttClient.setServer(mqtt_server, MQTT_PORT);
+  mqttClient.setCallback(callback);
+  reconnect();
   
   // Create FreeRTOS queue
   samples_queue = xQueueCreate(8, sizeof(sum_queue_t));
@@ -357,6 +457,7 @@ void setup() {
   //       (due to using the hardware FPU instructions).
   //       For manual control see: xTaskCreatePinnedToCore
   xTaskCreate(mic_i2s_reader_task, "Mic I2S Reader", I2S_TASK_STACK, NULL, I2S_TASK_PRI, NULL);
+  xTaskCreate(mqtt_loop_task, "MQTT Loop Task", MQTT_TASK_STACK, NULL, MQTT_TASK_PRI, NULL);
 
   sum_queue_t q;
   uint32_t Leq_samples = 0;
@@ -390,6 +491,11 @@ void setup() {
       
       // Serial output, customize (or remove) as needed
       Serial.printf("%.1f\n", Leq_dB);
+      String Leq_dB_str = String(Leq_dB, 5);
+      char Leq_dB_char[5];
+      Leq_dB_str.toCharArray(Leq_dB_char, 5);
+      publishSerialData(Leq_dB_char);
+
 
       // Debug only
       //Serial.printf("%u processing ticks\n", q.proc_ticks);
@@ -397,6 +503,4 @@ void setup() {
   }
 }
 
-void loop() {
-  // Nothing here..
-}
+void loop() {}
