@@ -76,7 +76,6 @@ void setup_wifi()
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
 }
-void(* resetFunc) (void) = 0;
 
 void reconnect()
 {
@@ -103,7 +102,6 @@ void reconnect()
       Serial.println(" try again in 5 seconds");
       // Wait 5 seconds before retrying
       delay(5000);
-      resetFunc(); 
     }
   }
 }
