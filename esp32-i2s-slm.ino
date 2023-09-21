@@ -49,7 +49,7 @@ const char *mqtt_server = "";
 #define MQTT_PORT 1883
 #define MQTT_USER ""
 #define MQTT_PASSWORD ""
-#define MQTT_SERIAL_BOOT_CH "/casa/esp32/noise/boot"
+#define MQTT_SERIAL_CONN_CH "/casa/esp32/noise/conn"
 #define MQTT_SERIAL_PUBLISH_CH "/casa/esp32/noise"
 #define MQTT_SERIAL_RECEIVER_CH "/casa/esp32/noise/receive"
 
@@ -92,7 +92,7 @@ void reconnect()
     {
       Serial.println("connected");
       // Once connected, publish an announcement...
-      mqttClient.publish(MQTT_SERIAL_BOOT_CH, "1");
+      mqttClient.publish(MQTT_SERIAL_CONN_CH, "1");
       // ... and resubscribe
       //mqttClient.subscribe(MQTT_SERIAL_RECEIVER_CH);
     }
@@ -299,7 +299,6 @@ struct sum_queue_t {
   // Debug only, FreeRTOS ticks we spent processing the I2S data
   uint32_t proc_ticks;
 };
-QueueHandle_t samples_queue;
 
 // Static buffer for block of samples
 float samples[SAMPLES_SHORT] __attribute__((aligned(4)));
@@ -365,57 +364,73 @@ void mic_i2s_init() {
 // we only do the minimum required work with the I2S data
 // until it is 'compressed' into sum of squares 
 //
-// FreeRTOS priority and stack size (in 32-bit words) 
-#define I2S_TASK_PRI   4
-#define I2S_TASK_STACK 2048
-//
-void mic_i2s_reader_task(void* parameter) {
-  mic_i2s_init();
 
-  // Discard first block, microphone may have startup time (i.e. INMP441 up to 83ms)
-  size_t bytes_read = 0;
-  i2s_read(I2S_PORT, &samples, SAMPLES_SHORT * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+uint32_t Leq_samples = 0;
+double Leq_sum_sqr = 0;
+double Leq_dB = 0;
+size_t bytes_read = 0;
 
-  while (true) {
-    // Block and wait for microphone values from I2S
-    //
-    // Data is moved from DMA buffers to our 'samples' buffer by the driver ISR
-    // and when there is requested ammount of data, task is unblocked
-    //
-    // Note: i2s_read does not care it is writing in float[] buffer, it will write
-    //       integer values to the given address, as received from the hardware peripheral. 
-    i2s_read(I2S_PORT, &samples, SAMPLES_SHORT * sizeof(SAMPLE_T), &bytes_read, portMAX_DELAY);
+void mic_i2s_reader_task() {
+  // Block and wait for microphone values from I2S
+  //
+  // Data is moved from DMA buffers to our 'samples' buffer by the driver ISR
+  // and when there is requested ammount of data, task is unblocked
+  //
+  // Note: i2s_read does not care it is writing in float[] buffer, it will write
+  //       integer values to the given address, as received from the hardware peripheral. 
+  i2s_read(I2S_PORT, &samples, SAMPLES_SHORT * sizeof(SAMPLE_T), &bytes_read, portMAX_DELAY);
 
-    TickType_t start_tick = xTaskGetTickCount();
-    
-    // Convert (including shifting) integer microphone values to floats, 
-    // using the same buffer (assumed sample size is same as size of float), 
-    // to save a bit of memory
-    SAMPLE_T* int_samples = (SAMPLE_T*)&samples;
-    for(int i=0; i<SAMPLES_SHORT; i++) samples[i] = MIC_CONVERT(int_samples[i]);
+  TickType_t start_tick = xTaskGetTickCount();
+  
+  // Convert (including shifting) integer microphone values to floats, 
+  // using the same buffer (assumed sample size is same as size of float), 
+  // to save a bit of memory
+  SAMPLE_T* int_samples = (SAMPLE_T*)&samples;
+  for(int i=0; i<SAMPLES_SHORT; i++) samples[i] = MIC_CONVERT(int_samples[i]);
 
-    sum_queue_t q;
-    // Apply equalization and calculate Z-weighted sum of squares, 
-    // writes filtered samples back to the same buffer.
-    q.sum_sqr_SPL = MIC_EQUALIZER.filter(samples, samples, SAMPLES_SHORT);
+  sum_queue_t q;
+  // Apply equalization and calculate Z-weighted sum of squares, 
+  // writes filtered samples back to the same buffer.
+  q.sum_sqr_SPL = MIC_EQUALIZER.filter(samples, samples, SAMPLES_SHORT);
 
-    // Apply weighting and calucate weigthed sum of squares
-    q.sum_sqr_weighted = WEIGHTING.filter(samples, samples, SAMPLES_SHORT);
+  // Apply weighting and calucate weigthed sum of squares
+  q.sum_sqr_weighted = WEIGHTING.filter(samples, samples, SAMPLES_SHORT);
 
-    // Debug only. Ticks we spent filtering and summing block of I2S data
-    q.proc_ticks = xTaskGetTickCount() - start_tick;
+  // Debug only. Ticks we spent filtering and summing block of I2S data
+  q.proc_ticks = xTaskGetTickCount() - start_tick;
 
-    // Send the sums to FreeRTOS queue where main task will pick them up
-    // and further calcualte decibel values (division, logarithms, etc...)
-    xQueueSend(samples_queue, &q, portMAX_DELAY);
+  // Calculate dB values relative to MIC_REF_AMPL and adjust for microphone reference
+  double short_RMS = sqrt(double(q.sum_sqr_SPL) / SAMPLES_SHORT);
+  double short_SPL_dB = MIC_OFFSET_DB + MIC_REF_DB + 20 * log10(short_RMS / MIC_REF_AMPL);
+
+  // In case of acoustic overload or below noise floor measurement, report infinty Leq value
+  if (short_SPL_dB > MIC_OVERLOAD_DB) {
+    Leq_sum_sqr = INFINITY;
+  } else if (isnan(short_SPL_dB) || (short_SPL_dB < MIC_NOISE_DB)) {
+    Leq_sum_sqr = -INFINITY;
   }
-}
 
-#define MQTT_TASK_PRI   4
-#define MQTT_TASK_STACK 2048
-void mqtt_loop_task(void* parameter) {
-  while (true) {
-    mqttClient.loop();
+  // Accumulate Leq sum
+  Leq_sum_sqr += q.sum_sqr_weighted;
+  Leq_samples += SAMPLES_SHORT;
+
+  // When we gather enough samples, calculate new Leq value
+  if (Leq_samples >= SAMPLE_RATE * LEQ_PERIOD) {
+    double Leq_RMS = sqrt(Leq_sum_sqr / Leq_samples);
+    Leq_dB = MIC_OFFSET_DB + MIC_REF_DB + 20 * log10(Leq_RMS / MIC_REF_AMPL);
+    Leq_sum_sqr = 0;
+    Leq_samples = 0;
+    
+    // Serial output, customize (or remove) as needed
+    Serial.printf("%.1f\n", Leq_dB);
+    String Leq_dB_str = String(Leq_dB, 5);
+    char Leq_dB_char[5];
+    Leq_dB_str.toCharArray(Leq_dB_char, 5);
+    publishSerialData(Leq_dB_char);
+
+
+    // Debug only
+    //Serial.printf("%u processing ticks\n", q.proc_ticks);
   }
 }
 
@@ -443,64 +458,18 @@ void setup() {
   Serial.begin(112500);
   delay(500); // Safety
   Serial.setTimeout(500); // Set time out for
+
+  mic_i2s_init();
+  // Discard first block, microphone may have startup time (i.e. INMP441 up to 83ms)
+  i2s_read(I2S_PORT, &samples, SAMPLES_SHORT * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+
   setup_wifi();
   mqttClient.setServer(mqtt_server, MQTT_PORT);
   mqttClient.setCallback(callback);
   reconnect();
-  
-  // Create FreeRTOS queue
-  samples_queue = xQueueCreate(8, sizeof(sum_queue_t));
-  
-  // Create the I2S reader FreeRTOS task
-  // NOTE: Current version of ESP-IDF will pin the task 
-  //       automatically to the first core it happens to run on
-  //       (due to using the hardware FPU instructions).
-  //       For manual control see: xTaskCreatePinnedToCore
-  xTaskCreate(mic_i2s_reader_task, "Mic I2S Reader", I2S_TASK_STACK, NULL, I2S_TASK_PRI, NULL);
-  xTaskCreate(mqtt_loop_task, "MQTT Loop Task", MQTT_TASK_STACK, NULL, MQTT_TASK_PRI, NULL);
-
-  sum_queue_t q;
-  uint32_t Leq_samples = 0;
-  double Leq_sum_sqr = 0;
-  double Leq_dB = 0;
-
-  // Read sum of samaples, calculated by 'i2s_reader_task'
-  while (xQueueReceive(samples_queue, &q, portMAX_DELAY)) {
-
-    // Calculate dB values relative to MIC_REF_AMPL and adjust for microphone reference
-    double short_RMS = sqrt(double(q.sum_sqr_SPL) / SAMPLES_SHORT);
-    double short_SPL_dB = MIC_OFFSET_DB + MIC_REF_DB + 20 * log10(short_RMS / MIC_REF_AMPL);
-
-    // In case of acoustic overload or below noise floor measurement, report infinty Leq value
-    if (short_SPL_dB > MIC_OVERLOAD_DB) {
-      Leq_sum_sqr = INFINITY;
-    } else if (isnan(short_SPL_dB) || (short_SPL_dB < MIC_NOISE_DB)) {
-      Leq_sum_sqr = -INFINITY;
-    }
-
-    // Accumulate Leq sum
-    Leq_sum_sqr += q.sum_sqr_weighted;
-    Leq_samples += SAMPLES_SHORT;
-
-    // When we gather enough samples, calculate new Leq value
-    if (Leq_samples >= SAMPLE_RATE * LEQ_PERIOD) {
-      double Leq_RMS = sqrt(Leq_sum_sqr / Leq_samples);
-      Leq_dB = MIC_OFFSET_DB + MIC_REF_DB + 20 * log10(Leq_RMS / MIC_REF_AMPL);
-      Leq_sum_sqr = 0;
-      Leq_samples = 0;
-      
-      // Serial output, customize (or remove) as needed
-      Serial.printf("%.1f\n", Leq_dB);
-      String Leq_dB_str = String(Leq_dB, 5);
-      char Leq_dB_char[5];
-      Leq_dB_str.toCharArray(Leq_dB_char, 5);
-      publishSerialData(Leq_dB_char);
-
-
-      // Debug only
-      //Serial.printf("%u processing ticks\n", q.proc_ticks);
-    }
-  }
 }
 
-void loop() {}
+void loop() {
+    mqttClient.loop();
+    mic_i2s_reader_task();
+  }
